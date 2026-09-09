@@ -1081,9 +1081,16 @@ export class GraphApp extends SignalWatcher(LitElement) {
 	private _postSignInPending = false;
 	private _wasAccountGated = false;
 
+	/** forces the graph to render as a logged-in Pro user by bypassing the account
+	 *  wall and the plan gate. Used for local UI testing — set to `false` (or delete) before
+	 *  committing; real entitlement is still validated host-side. */
+	private _forceEntitled = true;
+
 	/** Mirrors the host's `isAccountAccessRequired` — the predicate for the render swap to the
 	 *  account screen, and one of the two walls `isAccessGated` parks behind. */
 	private get isAccountGated(): boolean {
+		if (this._forceEntitled) return false;
+
 		const sub = this.graphState.subscription;
 		return sub != null && (sub.account == null || sub.account.verified === false);
 	}
@@ -1100,6 +1107,7 @@ export class GraphApp extends SignalWatcher(LitElement) {
 	 *  surface for an unentitled user; the welcome shows once they can use the graph) and while a
 	 *  deep-linked task action is parked/incoming (the action's intent trumps onboarding). */
 	private get shouldShowWelcome(): boolean {
+		if (this._forceEntitled) return false;
 		return (
 			!this.isAccountGated &&
 			(this.graphState.allowed ?? false) &&
@@ -1831,7 +1839,7 @@ export class GraphApp extends SignalWatcher(LitElement) {
 			></gl-graph-access-account>`;
 		}
 
-		if (!this.graphState.allowed) {
+		if (!this._forceEntitled && !this.graphState.allowed) {
 			return html`<gl-graph-gate .intentAction=${this._gatedPendingAction?.action}></gl-graph-gate>`;
 		}
 
