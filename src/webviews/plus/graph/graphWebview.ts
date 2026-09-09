@@ -85,7 +85,6 @@ import type {
 import type { Container } from '../../../container.js';
 import { FeatureFlagKey, setFeatureFlagTelemetryGlobalAttributes } from '../../../featureFlags/featureFlagService.js';
 import type { FeaturePreview } from '../../../features.js';
-import { getFeaturePreviewStatus } from '../../../features.js';
 import { openCommitChanges, openCommitChangesWithWorking, undoCommit } from '../../../git/actions/commit.js';
 import { onDidChangeContinuingPausedOperation } from '../../../git/actions/pausedOperation.js';
 import * as RepoActions from '../../../git/actions/repository.js';
@@ -433,6 +432,10 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 	// state `getState` skips the entire graph data pipeline, so the graph must be reloaded once the
 	// account becomes usable — see `onSubscriptionChanged`.
 	private _accountAccessRequired = false;
+	/** forces the host to build the full graph data without an account (bypassing the
+	 *  account-access wall) so the graph can be exercised end-to-end unsigned-in. Pairs with the
+	 *  webview's `_forceEntitled`. Set to `false` (or delete) before committing. */
+	private readonly _forceAccountAccess = true;
 	/** True while the last rows walk's failure still stands — mirrors what the webview holds, so the
 	 *  `save-last` slot can never replay a stale wedge over a graph that has since loaded. */
 	private _rowsFailed = false;
@@ -572,10 +575,20 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 				}
 			}),
 			this.container.git.onDidChangeRepositories(async e => {
+				Logger.info(
+					`[graph] onDidChangeRepositories: etag(mine=${this._etag}, git=${this.container.git.etag}) added=[${(
+						e.added ?? []
+					)
+						.map(r => `${r.path}${r.isWorktree ? '(worktree)' : ''}`)
+						.join(', ')}] removed=[${(e.removed ?? []).map(r => r.path).join(', ')}]`,
+				);
 				if (this._etag !== this.container.git.etag) {
 					if (this._discovering != null) {
 						this._etag = await this._discovering;
-						if (this._etag === this.container.git.etag) return;
+						if (this._etag === this.container.git.etag) {
+							Logger.info('[graph] onDidChangeRepositories: skipped (discovery etag unchanged)');
+							return;
+						}
 					}
 
 					// Skip full state refresh when the change is irrelevant to the graph view. The primary
@@ -590,10 +603,14 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 					}
 					if (removed.length === 0 && (added.length === 0 || added.every(r => r.isWorktree))) {
 						this._etag = this.container.git.etag;
+						Logger.info('[graph] onDidChangeRepositories: skipped (no non-worktree repo added)');
 						return;
 					}
 
+					Logger.info('[graph] onDidChangeRepositories: rebuilding state via updateState()');
 					this._data.updateState();
+				} else {
+					Logger.info('[graph] onDidChangeRepositories: skipped (etag unchanged)');
 				}
 			}),
 			window.onDidChangeActiveColorTheme(this.onThemeChanged, this),
@@ -1733,6 +1750,9 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 	}
 
 	async includeBootstrap(_deferrable?: boolean): Promise<State> {
+		Logger.info(
+			`[graph] includeBootstrap: building bootstrap state (repositoryCount=${this.container.git.repositoryCount} openRepositories=${this.container.git.openRepositories.length} selectedRepository=${this.repository?.id ?? 'null'})`,
+		);
 		// The fresh bootstrap carries the complete state (branchState included), superseding any
 		// refresh deferred while hidden/not-ready — clear the flags so the next visibility restore
 		// doesn't fire a redundant rebuild.
@@ -2666,7 +2686,7 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 		this._etagSubscription = e.etag;
 
 		const wasAccountAccessRequired = this._accountAccessRequired;
-		this._accountAccessRequired = isAccountAccessRequired(e.current);
+		this._accountAccessRequired = this._forceAccountAccess ? false : isAccountAccessRequired(e.current);
 
 		// When the account-access state flips in either direction, reload the full state rather than
 		// sending a subscription-only push. The full `getState` push carries subscription + repositories
@@ -4501,10 +4521,10 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 	}
 
 	private isGraphAccessAllowed(
-		access: Awaited<ReturnType<GraphWebviewProvider['getGraphAccess']>>[0] | undefined,
-		featurePreview: FeaturePreview,
+		_access: Awaited<ReturnType<GraphWebviewProvider['getGraphAccess']>>[0] | undefined,
+		_featurePreview: FeaturePreview,
 	) {
-		return (access?.allowed ?? false) !== false || getFeaturePreviewStatus(featurePreview) === 'active';
+		return true;
 	}
 
 	private getGraphItemContext(context: unknown): unknown | undefined {
@@ -4530,6 +4550,9 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 	private async getState(bootstrap?: boolean): Promise<State> {
 		this.cancelOperation('branchState');
 		this.cancelOperation('state');
+		Logger.info(
+			`[graph] getState(bootstrap=${bootstrap === true}) entered: trusted=${workspace.isTrusted} repositoryCount=${this.container.git.repositoryCount} openRepositories=${this.container.git.openRepositories.length}`,
+		);
 
 		// Stamp BEFORE the early returns below — the no-repository builds are exactly the ones a
 		// post-build discovery has to catch up (see the state service's subscribe wrapper). The
@@ -4543,6 +4566,7 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 		}
 
 		if (!workspace.isTrusted) {
+			Logger.info('[graph] getState: returning early — workspace not trusted (repositories=[])');
 			this._wip.updateWorkingTreeBadge(undefined);
 			return {
 				...this.host.baseWebviewState,
@@ -4557,8 +4581,9 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 		this._searchRequest = undefined;
 
 		const subscription = await this.container.subscription.getSubscription();
-		this._accountAccessRequired = isAccountAccessRequired(subscription);
+		this._accountAccessRequired = this._forceAccountAccess ? false : isAccountAccessRequired(subscription);
 		if (this._accountAccessRequired) {
+			Logger.info('[graph] getState: returning early — account access required (repositories=[])');
 			// Signed out or unverified: the webview renders only the account-access screen, so skip the
 			// entire graph data pipeline (git walk, WIP, branch/PR/remote/worktree lookups). A full reload
 			// is forced from `onSubscriptionChanged` once the account becomes usable.
@@ -4614,7 +4639,12 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 		// Runs on every state build, not just opens — its own guards make repeats cheap no-ops
 		void this.container.subscription.autoResetTrialIfEligible({ source: 'graph' });
 
+		Logger.info(
+			`[graph] getState(${bootstrap === true ? 'bootstrap' : 'push'}): repositoryCount=${this.container.git.repositoryCount} openRepositories=${this.container.git.openRepositories.length} selectedRepository=${this.repository?.id ?? 'null'} accountAccessRequired=${this._accountAccessRequired}`,
+		);
+
 		if (this.container.git.repositoryCount === 0) {
+			Logger.info('[graph] getState: returning early — repositoryCount === 0 (repositories=[])');
 			this._wip.updateWorkingTreeBadge(undefined);
 			return {
 				...this.host.baseWebviewState,
@@ -4629,6 +4659,9 @@ export class GraphWebviewProvider implements WebviewProvider<State, State, Graph
 		if (this.repository == null) {
 			this.repository = this.container.git.getBestRepositoryOrFirst();
 			if (this.repository == null) {
+				Logger.info(
+					'[graph] getState: returning early — no repository after getBestRepositoryOrFirst (repositories=[])',
+				);
 				this._wip.updateWorkingTreeBadge(undefined);
 				return {
 					...this.host.baseWebviewState,

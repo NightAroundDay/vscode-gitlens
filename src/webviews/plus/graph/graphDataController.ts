@@ -258,6 +258,9 @@ export class GraphDataController {
 	@trace()
 	async notifyDidChangeState(): Promise<boolean> {
 		if (!this.host.ready || !this.host.visible) {
+			Logger.info(
+				`[graph] notifyDidChangeState: deferred (ready=${this.host.ready}, visible=${this.host.visible})`,
+			);
 			this.context.deferStateRefresh();
 			return false;
 		}
@@ -278,6 +281,9 @@ export class GraphDataController {
 		if (this._lastStateSentAt != null) {
 			const elapsed = performance.now() - this._lastStateSentAt;
 			if (elapsed < GraphDataController.stateFreshnessMs) {
+				Logger.info(
+					`[graph] notifyDidChangeState: deferred (freshness window, ${elapsed.toFixed(0)}ms < ${GraphDataController.stateFreshnessMs}ms)`,
+				);
 				this._stateFreshnessRetryTimer ??= setTimeout(() => {
 					this._stateFreshnessRetryTimer = undefined;
 					void this.notifyDidChangeState();
